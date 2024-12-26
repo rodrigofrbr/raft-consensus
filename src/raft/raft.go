@@ -17,13 +17,15 @@ package raft
 //   in the same server.
 //
 
-import "sync"
-import "labrpc"
+import (
+	"sync"
+	"labrpc"
+	"math/rand"
+	"time"
+)
 
 // import "bytes"
 // import "encoding/gob"
-
-
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -46,10 +48,14 @@ type Raft struct {
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 
-	// Your data here (2A, 2B, 2C).
-	// Look at the paper's Figure 2 for a description of what
-	// state a Raft server must maintain.
+	// Persistent state on all servers
+	currentTerm int
+	votedFor    int
 
+	// Additional state
+	state        string
+	heartbeatCh  chan bool
+	electionTimeOut time.Duration
 }
 
 // return currentTerm and whether this server
@@ -58,7 +64,10 @@ func (rf *Raft) GetState() (int, bool) {
 
 	var term int
 	var isleader bool
-	// Your code here (2A).
+
+	term = rf.currentTerm
+	isleader = rf.state == "leader"
+
 	return term, isleader
 }
 
@@ -101,7 +110,8 @@ func (rf *Raft) readPersist(data []byte) {
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
+	Term         int
+	CandidateId  int
 }
 
 //
@@ -109,14 +119,32 @@ type RequestVoteArgs struct {
 // field names must start with capital letters!
 //
 type RequestVoteReply struct {
-	// Your data here (2A).
+	Term        int
+	VoteGranted bool
 }
 
 //
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
+	rf.mu.Lock()
+
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+		rf.state = "follower"
+	}
+
+	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) {
+		rf.votedFor = args.CandidateId
+		reply.VoteGranted = true
+	} else {
+		reply.VoteGranted = false
+	}
+
+	reply.Term = rf.currentTerm
+
+	rf.mu.Unlock()
 }
 
 //
@@ -199,18 +227,132 @@ func (rf *Raft) Kill() {
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
 //
-func Make(peers []*labrpc.ClientEnd, me int,
-	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	rf := &Raft{}
-	rf.peers = peers
-	rf.persister = persister
-	rf.me = me
-
-	// Your initialization code here (2A, 2B, 2C).
+func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan ApplyMsg) *Raft {
+	rf := &Raft{
+		peers:       peers,
+		persister:   persister,
+		me:          me,
+		state:       "follower",
+		votedFor:    -1,
+		heartbeatCh: make(chan bool, 100),
+	}
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	rf.SetElectionTimeOut()
+
+	go rf.run()
 
 	return rf
+}
+
+func (rf *Raft) SetElectionTimeOut() {
+	rf.electionTimeOut = time.Duration(300+rand.Intn(150)) * time.Millisecond
+}
+
+func (rf *Raft) run() {
+	for {
+		switch rf.state {
+		case "follower":
+			rf.runFollower()
+		case "candidate":
+			rf.runCandidate()
+		case "leader":
+			rf.runLeader()
+		}
+	}
+}
+
+func (rf *Raft) runFollower() {
+	select {
+	case <-rf.heartbeatCh:
+		rf.SetElectionTimeOut()
+	case <-time.After(rf.electionTimeOut):
+		rf.state = "candidate"
+	}
+}
+
+func (rf *Raft) runCandidate() {
+    rf.mu.Lock()
+    rf.currentTerm++
+    rf.votedFor = rf.me
+	rf.mu.Unlock()
+
+    votes := 1
+    for i := range rf.peers {
+        if i != rf.me && rf.state != "follower" {
+            go func(i int) {
+                args := &RequestVoteArgs{
+                    Term:         rf.currentTerm,
+                    CandidateId:  rf.me,
+                }
+                reply := &RequestVoteReply{}
+                if rf.sendRequestVote(i, args, reply) && reply.VoteGranted {
+                    rf.mu.Lock()
+                    votes++
+                    if votes > len(rf.peers)/2 {
+                        rf.state = "leader"
+                        rf.mu.Unlock()
+                        return
+                    }
+                    rf.mu.Unlock()
+                }
+            }(i)
+        }
+    }
+
+    select {
+    case <-time.After(rf.electionTimeOut): 
+        return
+    }
+}
+
+
+func (rf *Raft) runLeader() {
+	for i := range rf.peers {
+		if i != rf.me {
+			go func(i int) {
+				args := &AppendEntriesArgs{
+					Term:     rf.currentTerm,
+					LeaderId: rf.me,
+				}
+				reply := &AppendEntriesReply{}
+				rf.sendAppendEntries(i, args, reply) //os heartbeats
+			}(i)
+		}
+	}
+	time.Sleep(100 * time.Millisecond)
+}
+
+type AppendEntriesArgs struct {
+	Term         int
+	LeaderId     int
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+
+	reply.Term = rf.currentTerm
+
+	if args.Term < rf.currentTerm {
+		reply.Success = false
+	} else {
+		rf.SetElectionTimeOut()
+		rf.heartbeatCh <- true
+		rf.currentTerm = args.Term
+		rf.state = "follower"
+		reply.Success = true
+	}
+
+	rf.mu.Unlock()
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	return rf.peers[server].Call("Raft.AppendEntries", args, reply)
 }
