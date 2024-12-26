@@ -43,16 +43,12 @@ type ApplyMsg struct {
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
-	peers     []*labrpc.ClientEnd // RPC end points of all peers
-	persister *Persister          // Object to hold this peer's persisted state
-	me        int                 // this peer's index into peers[]
-
-	// Persistent state on all servers
+	mu        sync.Mutex          
+	peers     []*labrpc.ClientEnd 
+	persister *Persister          
+	me        int                 
 	currentTerm int
 	votedFor    int
-
-	// Additional state
 	state        string
 	heartbeatCh  chan bool
 	electionTimeOut time.Duration
@@ -248,7 +244,9 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 }
 
 func (rf *Raft) SetElectionTimeOut() {
-	rf.electionTimeOut = time.Duration(300+rand.Intn(150)) * time.Millisecond
+	rf.mu.Lock()
+	rf.electionTimeOut = time.Duration(1000+rand.Intn(500)) * time.Millisecond
+	rf.mu.Unlock()
 }
 
 func (rf *Raft) run() {
@@ -322,7 +320,7 @@ func (rf *Raft) runLeader() {
 			}(i)
 		}
 	}
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 }
 
 type AppendEntriesArgs struct {
@@ -338,17 +336,17 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 
-	reply.Term = rf.currentTerm
-
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 	} else {
 		rf.SetElectionTimeOut()
-		rf.heartbeatCh <- true
 		rf.currentTerm = args.Term
 		rf.state = "follower"
 		reply.Success = true
 	}
+
+	reply.Term = rf.currentTerm
+	rf.heartbeatCh <- true
 
 	rf.mu.Unlock()
 }
